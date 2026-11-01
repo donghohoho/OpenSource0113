@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AI 도트 캐릭터 생성기</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header>
+    <h1>AI 도트 캐릭터 생성기</h1>
+    <p class="sub">동물이나 사람 사진을 올리면 32×32 도트 캐릭터를 만들어 걸어다니게 해 줍니다.</p>
+  </header>
+
+  <main>
+    <section class="panel" id="upload-panel">
+      <h2>1. 사진 올리기</h2>
+      <label class="drop" id="drop">
+        <input type="file" id="file" accept=".jpg,.jpeg,.png,.webp,image/jpeg,image/png,image/webp">
+        <img id="preview" alt="" hidden>
+        <span id="drop-text">여기를 눌러 사진을 고르거나 끌어다 놓으세요</span>
+      </label>
+      <p class="hint">JPG · PNG · WEBP, <span id="max-mb">5</span>MB 이하. 대상이 크고 또렷하게 나온 사진이 잘 됩니다.</p>
+
+      <h2>2. 캐릭터 만들기</h2>
+      <button id="generate" disabled>캐릭터 만들기</button>
+      <p id="status" class="status" role="status"></p>
+      <p id="model-info" class="hint"></p>
+    </section>
+
+    <section class="panel" id="sheet-panel">
+      <h2>스프라이트 시트</h2>
+      <div class="sheet-wrap"><img id="sheet" alt="스프라이트 시트" src="/reference/default_sheet.png"></div>
+      <p class="hint" id="sheet-label">기본 캐릭터 (줄: 아래 · 왼쪽 · 오른쪽 · 위 / 칸: 걷기 4프레임)</p>
+      <div class="row">
+        <a id="download" class="button" href="/reference/default_sheet.png" download="sprite_sheet.png">PNG 다운로드</a>
+        <button id="reset" class="secondary" hidden>기본 캐릭터로 되돌리기</button>
+      </div>
+    </section>
+
+    <section class="panel game-panel">
+      <h2>3. 걸어다니기 <span class="hint">WASD / 방향키 이동 · 스페이스 점프</span></h2>
+      <canvas id="game" width="640" height="384" tabindex="0"></canvas>
+    </section>
+  </main>
+
+  <script src="app.js"></script>
+</body>
+</html>
