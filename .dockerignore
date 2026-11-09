@@ -1,0 +1,26 @@
+# Secrets: the API key is only ever passed at `docker run` time
+.env
+.env.*
+**/.env
+**/.env.*
+
+# Version control and CI
+.git
+.gitignore
+.github
+
+# Local Python environment and caches
+.venv
+venv
+**/__pycache__
+**/*.pyc
+
+# Not needed at runtime
+test_assets
+scripts
+*.zip
+*.md
+Dockerfile
+.dockerignore
+.DS_Store
+**/.DS_Store
