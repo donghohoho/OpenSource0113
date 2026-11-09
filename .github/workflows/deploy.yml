@@ -7,8 +7,9 @@ on:
     types: [completed]
     branches: [main]
 
-# This job needs no GitHub API access and never checks out repository code.
-permissions: {}
+# Read access is only for checking out deploy/ from main.
+permissions:
+  contents: read
 
 # Never run two deployments at once; a newer pending one replaces an older pending one.
 concurrency:
@@ -25,7 +26,8 @@ jobs:
       github.event.workflow_run.head_branch == 'main' &&
       github.event.workflow_run.head_repository.full_name == github.repository
     runs-on: [self-hosted, macOS, ARM64]
-    timeout-minutes: 10
+    # Allows for the old container finishing a running generation (see DRAIN_SECONDS).
+    timeout-minutes: 25
     defaults:
       run:
         shell: bash
@@ -33,10 +35,19 @@ jobs:
       # head_sha is the commit CI built. github.sha would be the latest commit on main.
       COMMIT_SHA: ${{ github.event.workflow_run.head_sha }}
       IMAGE: ${{ secrets.DOCKERHUB_USERNAME }}/sprite-maker:${{ github.event.workflow_run.head_sha }}
-      CONTAINER_NAME: sprite-maker
+      DEPLOY_PREFIX: sprite-maker
+      PROXY_PORT: "8000"
       APP_URL: http://127.0.0.1:8000
+      PROXY_IMAGE: nginx:1.30.6-alpine@sha256:583b7f2fce1cdb8da5ad5c39ebd3c33b98b87d493190e548bdee1fa8c619c311
 
     steps:
+      # github.sha on workflow_run is the commit this workflow file came from, so the
+      # scripts always match the workflow. Only code already on main can reach this.
+      - name: Check out deploy scripts
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
       - name: Check Docker
         run: |
           # A runner started as a service may not inherit the login shell's PATH.
@@ -78,6 +89,29 @@ jobs:
           echo '{"auths":{"https://index.docker.io/v1/":{}}}' > "$docker_config/config.json"
           echo "DOCKER_CONFIG=$docker_config" >> "$GITHUB_ENV"
 
+      # A separate process that outlives this step. Nothing is changed until it has seen
+      # the current service answer normally.
+      - name: Start monitoring
+        run: |
+          if ! python3 -c 'import sys; sys.exit(sys.version_info < (3, 9))'; then
+            echo "::error::모니터링에 필요한 Python 3.9 이상을 찾을 수 없습니다."
+            exit 1
+          fi
+          monitor_dir="$RUNNER_TEMP/deploy-monitor"
+          mkdir -p "$monitor_dir"
+          echo "MONITOR_DIR=$monitor_dir" >> "$GITHUB_ENV"
+          nohup python3 deploy/monitor.py run --dir "$monitor_dir" --url "$APP_URL/health" \
+            > "$monitor_dir/monitor-process.log" 2>&1 &
+
+          if ! docker container inspect "$DEPLOY_PREFIX-proxy" >/dev/null 2>&1 \
+            && ! docker container inspect "$DEPLOY_PREFIX" >/dev/null 2>&1; then
+            echo "::warning::실행 중인 서비스가 없어 배포 전 상태 확인을 건너뜁니다 (최초 배포)."
+          elif ! python3 deploy/monitor.py wait-healthy --dir "$monitor_dir"; then
+            echo "::error::현재 서비스가 $APP_URL/health 에 정상 응답하지 않아 배포를 시작하지 않습니다. 맥북에서 컨테이너 상태를 먼저 확인하세요."
+            exit 1
+          fi
+          python3 deploy/monitor.py mark --dir "$monitor_dir" deploy_start
+
       # Runs before anything is replaced, so a missing key cannot take the service down.
       - name: Check API key file
         run: |
@@ -103,77 +137,47 @@ jobs:
           DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
         run: printf '%s' "$DOCKERHUB_TOKEN" | docker login --username "$DOCKERHUB_USERNAME" --password-stdin
 
-      # Pull before touching the old container, so a failed pull causes no downtime.
-      - name: Pull the image CI built
-        run: docker pull "$IMAGE"
-
-      - name: Replace the container
+      - name: Pull images
         run: |
-          if docker container inspect "$CONTAINER_NAME" >/dev/null 2>&1; then
-            docker stop "$CONTAINER_NAME"
-            docker rm "$CONTAINER_NAME"
+          docker pull "$IMAGE"
+          docker pull "$PROXY_IMAGE"
+
+      - name: Switch to the new version
+        id: switch
+        run: bash deploy/bluegreen.sh
+
+      # Everything from here on also runs after a failure, so the log and summary remain.
+      - name: Finish monitoring
+        if: always()
+        run: |
+          if [ -n "${MONITOR_DIR:-}" ]; then
+            python3 deploy/monitor.py mark --dir "$MONITOR_DIR" deploy_end
+            python3 deploy/monitor.py wait-exit --dir "$MONITOR_DIR"
           fi
-          # -e wins over --env-file, so a stray APP_VERSION in the key file cannot
-          # misreport the version.
-          docker run --detach \
-            --name "$CONTAINER_NAME" \
-            --restart unless-stopped \
-            --publish 127.0.0.1:8000:8000 \
-            --env-file "$SPRITE_ENV_FILE" \
-            --env "APP_VERSION=$COMMIT_SHA" \
-            "$IMAGE"
-
-      # Checks the main page and /health only. It never calls the generation API.
-      - name: Wait for the service
-        id: verify
-        run: |
-          max_attempts=30
-          health=""
-          page=""
-          for attempt in $(seq 1 "$max_attempts"); do
-            status="$(docker inspect --format '{{.State.Status}}' "$CONTAINER_NAME")"
-            if [ "$status" = "exited" ] || [ "$status" = "dead" ] || [ "$status" = "restarting" ]; then
-              echo "::error::컨테이너가 시작 직후 중단되었습니다 (상태: $status)."
-              docker logs --tail 30 "$CONTAINER_NAME" 2>&1
-              exit 1
-            fi
-
-            health="$(curl --silent --fail --max-time 3 "$APP_URL/health")" || health=""
-            page="$(curl --silent --fail --max-time 3 "$APP_URL/")" || page=""
-            if [[ "$health" == *'"status":"ok"'* && "$health" == *"\"version\":\"$COMMIT_SHA\""* ]] \
-              && grep -qi '<html' <<<"$page"; then
-              echo "Service is up after $attempt attempt(s): $health"
-              echo "health=$health" >> "$GITHUB_OUTPUT"
-              echo "page=ok" >> "$GITHUB_OUTPUT"
-              exit 0
-            fi
-            sleep 2
-          done
-
-          echo "::error::$((max_attempts * 2))초 안에 서비스가 정상 응답하지 않았습니다. 기대한 버전: $COMMIT_SHA, /health 응답: ${health:-없음}"
-          docker logs --tail 30 "$CONTAINER_NAME" 2>&1
-          exit 1
 
       - name: Write summary
         if: always()
         env:
-          JOB_STATUS: ${{ job.status }}
-          VERIFY_OUTCOME: ${{ steps.verify.outcome }}
-          PAGE_RESULT: ${{ steps.verify.outputs.page }}
-          HEALTH_RESULT: ${{ steps.verify.outputs.health }}
+          DEPLOY_RESULT: ${{ job.status }}
+          DEPLOY_MODE: ${{ steps.switch.outputs.mode }}
+          FROM_COLOR: ${{ steps.switch.outputs.from_color }}
+          TO_COLOR: ${{ steps.switch.outputs.to_color }}
+          FAILURE_REASON: ${{ steps.switch.outputs.failure_reason }}
         run: |
-          {
-            echo "## 배포 결과: $JOB_STATUS"
-            echo
-            echo "| 항목 | 값 |"
-            echo "|---|---|"
-            echo "| 이미지 태그 | \`sprite-maker:$COMMIT_SHA\` |"
-            echo "| 커밋 SHA | \`$COMMIT_SHA\` |"
-            echo "| 시간 | $(date '+%Y-%m-%d %H:%M:%S %Z') |"
-            echo "| 확인 단계 | $VERIFY_OUTCOME |"
-            echo "| 메인 페이지 | ${PAGE_RESULT:-확인 안 됨} |"
-            echo "| /health | \`${HEALTH_RESULT:-확인 안 됨}\` |"
-          } >> "$GITHUB_STEP_SUMMARY"
+          if [ -n "${MONITOR_DIR:-}" ]; then
+            python3 deploy/monitor.py summary --dir "$MONITOR_DIR" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "## ❌ 배포 실패: 모니터링 시작 전 단계에서 중단됨 (로그 참고)" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload monitoring log
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: deploy-monitor-${{ github.event.workflow_run.head_sha }}
+          path: ${{ runner.temp }}/deploy-monitor
+          if-no-files-found: warn
+          retention-days: 14
 
       - name: Remove Docker Hub credentials
         if: always()
