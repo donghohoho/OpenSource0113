@@ -29,6 +29,9 @@ BASE_URL = PROVIDERS[AI_PROVIDER]["base_url"]
 
 CLAUDE_MODEL = os.getenv("CLAUDE_MODEL") or DEFAULT_MODEL
 
+# Commit SHA of the running build, set by `docker run -e APP_VERSION=...` at deploy time.
+APP_VERSION = os.getenv("APP_VERSION") or "unknown"
+
 # The JSON answer (3 frames x 32 rows x 32 hex chars) is ~2-3k tokens. Opus 5.5 always thinks and
 # thinking tokens count toward max_tokens, so leave room for that at low effort.
 MAX_TOKENS = int(os.getenv("CLAUDE_MAX_TOKENS", "16000"))

@@ -62,6 +62,12 @@ def _prepare_photo(raw: bytes) -> bytes:
     return buf.getvalue()
 
 
+@app.get("/health")
+def health():
+    # Deploy check: which build is running. Makes no AI call and exposes no settings.
+    return {"status": "ok", "version": config.APP_VERSION}
+
+
 @app.get("/api/config")
 def get_config():
     # Only whether a key exists, never the key itself.

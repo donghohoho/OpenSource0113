@@ -1,0 +1,183 @@
+name: Deploy to self-hosted runner
+
+# Runs after ci.yml finishes. The name below must match the `name:` in ci.yml.
+on:
+  workflow_run:
+    workflows: ["Build and push Docker image"]
+    types: [completed]
+    branches: [main]
+
+# This job needs no GitHub API access and never checks out repository code.
+permissions: {}
+
+# Never run two deployments at once; a newer pending one replaces an older pending one.
+concurrency:
+  group: deploy-sprite-maker
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    # GitHub evaluates this before a runner is assigned. In a public repository the
+    # branch filter above is not enough: it matches a fork's branch named main too.
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_branch == 'main' &&
+      github.event.workflow_run.head_repository.full_name == github.repository
+    runs-on: [self-hosted, macOS, ARM64]
+    timeout-minutes: 10
+    defaults:
+      run:
+        shell: bash
+    env:
+      # head_sha is the commit CI built. github.sha would be the latest commit on main.
+      COMMIT_SHA: ${{ github.event.workflow_run.head_sha }}
+      IMAGE: ${{ secrets.DOCKERHUB_USERNAME }}/sprite-maker:${{ github.event.workflow_run.head_sha }}
+      CONTAINER_NAME: sprite-maker
+      APP_URL: http://127.0.0.1:8000
+
+    steps:
+      - name: Check Docker
+        run: |
+          # A runner started as a service may not inherit the login shell's PATH.
+          if ! command -v docker >/dev/null 2>&1; then
+            for dir in /Applications/Docker.app/Contents/Resources/bin "$HOME/.docker/bin" /usr/local/bin /opt/homebrew/bin; do
+              if [ -x "$dir/docker" ]; then
+                export PATH="$dir:$PATH"
+                echo "$dir" >> "$GITHUB_PATH"
+                echo "Added $dir to PATH"
+                break
+              fi
+            done
+          fi
+          if ! command -v docker >/dev/null 2>&1; then
+            echo "::error::Docker CLI를 찾을 수 없습니다. Docker Desktop 설치를 확인하세요."
+            exit 1
+          fi
+
+          # Resolve the engine socket from the owner's Docker context now, because the
+          # next lines switch DOCKER_CONFIG and contexts are stored in that directory.
+          if ! docker_host="$(docker context inspect --format '{{.Endpoints.docker.Host}}')"; then
+            echo "::error::Docker context를 읽을 수 없습니다."
+            exit 1
+          fi
+          export DOCKER_HOST="$docker_host"
+          echo "DOCKER_HOST=$docker_host" >> "$GITHUB_ENV"
+
+          if ! server_version="$(docker version --format '{{.Server.Version}}')"; then
+            echo "::error::Docker 엔진에 연결할 수 없습니다. 맥북에서 Docker Desktop이 실행 중인지 확인하세요."
+            exit 1
+          fi
+          echo "Docker engine $server_version is running"
+
+          # Keep the Docker Hub token in a throwaway directory, away from the owner's
+          # own login in the macOS keychain. An entry under "auths" stops the CLI from
+          # auto-selecting the osxkeychain helper, so the token stays in this file.
+          umask 077
+          docker_config="$(mktemp -d "$RUNNER_TEMP/docker-config.XXXXXX")"
+          echo '{"auths":{"https://index.docker.io/v1/":{}}}' > "$docker_config/config.json"
+          echo "DOCKER_CONFIG=$docker_config" >> "$GITHUB_ENV"
+
+      # Runs before anything is replaced, so a missing key cannot take the service down.
+      - name: Check API key file
+        run: |
+          env_file="$HOME/.sprite-maker/.env"
+          if [ ! -f "$env_file" ]; then
+            echo "::error::API 키 파일이 없어 배포를 중단합니다: ~/.sprite-maker/.env 파일을 맥북에 만드세요. 기존 컨테이너는 그대로 둡니다."
+            exit 1
+          fi
+          if [ ! -s "$env_file" ] || [ ! -r "$env_file" ]; then
+            echo "::error::API 키 파일이 비어 있거나 읽을 수 없어 배포를 중단합니다: ~/.sprite-maker/.env"
+            exit 1
+          fi
+          mode="$(stat -f '%Lp' "$env_file")"
+          if [ "$mode" != "600" ]; then
+            echo "::warning::~/.sprite-maker/.env 권한이 $mode 입니다. chmod 600을 권장합니다."
+          fi
+          echo "SPRITE_ENV_FILE=$env_file" >> "$GITHUB_ENV"
+          echo "API key file found (contents not read)"
+
+      - name: Log in to Docker Hub
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: printf '%s' "$DOCKERHUB_TOKEN" | docker login --username "$DOCKERHUB_USERNAME" --password-stdin
+
+      # Pull before touching the old container, so a failed pull causes no downtime.
+      - name: Pull the image CI built
+        run: docker pull "$IMAGE"
+
+      - name: Replace the container
+        run: |
+          if docker container inspect "$CONTAINER_NAME" >/dev/null 2>&1; then
+            docker stop "$CONTAINER_NAME"
+            docker rm "$CONTAINER_NAME"
+          fi
+          # -e wins over --env-file, so a stray APP_VERSION in the key file cannot
+          # misreport the version.
+          docker run --detach \
+            --name "$CONTAINER_NAME" \
+            --restart unless-stopped \
+            --publish 127.0.0.1:8000:8000 \
+            --env-file "$SPRITE_ENV_FILE" \
+            --env "APP_VERSION=$COMMIT_SHA" \
+            "$IMAGE"
+
+      # Checks the main page and /health only. It never calls the generation API.
+      - name: Wait for the service
+        id: verify
+        run: |
+          max_attempts=30
+          health=""
+          page=""
+          for attempt in $(seq 1 "$max_attempts"); do
+            status="$(docker inspect --format '{{.State.Status}}' "$CONTAINER_NAME")"
+            if [ "$status" = "exited" ] || [ "$status" = "dead" ] || [ "$status" = "restarting" ]; then
+              echo "::error::컨테이너가 시작 직후 중단되었습니다 (상태: $status)."
+              docker logs --tail 30 "$CONTAINER_NAME" 2>&1
+              exit 1
+            fi
+
+            health="$(curl --silent --fail --max-time 3 "$APP_URL/health")" || health=""
+            page="$(curl --silent --fail --max-time 3 "$APP_URL/")" || page=""
+            if [[ "$health" == *'"status":"ok"'* && "$health" == *"\"version\":\"$COMMIT_SHA\""* ]] \
+              && grep -qi '<html' <<<"$page"; then
+              echo "Service is up after $attempt attempt(s): $health"
+              echo "health=$health" >> "$GITHUB_OUTPUT"
+              echo "page=ok" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            sleep 2
+          done
+
+          echo "::error::$((max_attempts * 2))초 안에 서비스가 정상 응답하지 않았습니다. 기대한 버전: $COMMIT_SHA, /health 응답: ${health:-없음}"
+          docker logs --tail 30 "$CONTAINER_NAME" 2>&1
+          exit 1
+
+      - name: Write summary
+        if: always()
+        env:
+          JOB_STATUS: ${{ job.status }}
+          VERIFY_OUTCOME: ${{ steps.verify.outcome }}
+          PAGE_RESULT: ${{ steps.verify.outputs.page }}
+          HEALTH_RESULT: ${{ steps.verify.outputs.health }}
+        run: |
+          {
+            echo "## 배포 결과: $JOB_STATUS"
+            echo
+            echo "| 항목 | 값 |"
+            echo "|---|---|"
+            echo "| 이미지 태그 | \`sprite-maker:$COMMIT_SHA\` |"
+            echo "| 커밋 SHA | \`$COMMIT_SHA\` |"
+            echo "| 시간 | $(date '+%Y-%m-%d %H:%M:%S %Z') |"
+            echo "| 확인 단계 | $VERIFY_OUTCOME |"
+            echo "| 메인 페이지 | ${PAGE_RESULT:-확인 안 됨} |"
+            echo "| /health | \`${HEALTH_RESULT:-확인 안 됨}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Remove Docker Hub credentials
+        if: always()
+        run: |
+          case "${DOCKER_CONFIG:-}" in
+            "$RUNNER_TEMP"/docker-config.*) rm -rf "$DOCKER_CONFIG" ;;
+          esac
