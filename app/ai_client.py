@@ -53,14 +53,17 @@ STYLE:
 - Draw an original character. Do not copy or imitate any existing game or anime character.
 """
 
-USER_INSTRUCTIONS = """Image 1 is the FORMAT REFERENCE sprite sheet (a plain white blob placeholder, shown
+USER_INSTRUCTIONS = """Image 1 is the FORMAT REFERENCE sprite sheet (a generic humanoid placeholder, shown
 enlarged 4x on a green background that is NOT part of the sprite). Rows top to bottom: facing down,
-left, right, up; 4 walk frames per row; each cell is 32x32 pixels. Use it ONLY for layout, how each
-direction looks (front: both eyes, side: one eye, back: no face), body proportion inside the 32x32
-cell, and outline thickness. Do NOT copy its shape or colors.
+left, right, up; 4 walk frames per row; each cell is 32x32 pixels. Use it ONLY for format, proportion
+and pose: the layout, how each direction looks (front: both eyes, side: one eye and a profile, back: no
+face), where the head, arms and legs sit inside the 32x32 cell, and outline thickness. Do NOT copy its
+shape, hair, clothes or colors. Draw each view as a still standing pose like the first column of its
+row; the walk animation is added afterwards by code.
 
 Image 2 is the user's photo. Draw a new pixel-art character based on the animal or person in it,
-keeping its colors and distinctive features.
+keeping its colors and distinctive features. The shape and colors must come from the photo: if it shows
+an animal, draw that animal with its own body, not a human.
 
 Return only the JSON object with "palette" and the three frames "front", "back", "right"."""
 

@@ -1,4 +1,4 @@
-"""Pixel grid helpers: walk animation, sprite sheet assembly, default blob character.
+"""Pixel grid helpers: walk animation, sprite sheet assembly, default humanoid character.
 
 A "grid" is a 32x32 list of lists of palette indices. Index 0 is transparent.
 Sheet layout (matches reference/default_sheet.png):
@@ -114,54 +114,157 @@ def to_png_bytes(img: Image.Image) -> bytes:
     return buf.getvalue()
 
 
-# ---------------------------------------------------------------- default blob
-BLOB_PALETTE = [
+# ---------------------------------------------------------------- default character
+# Index 0 is transparent. Each ramp runs light, mid, dark.
+DEFAULT_PALETTE = [
     "transparent",
-    "#2a2433",  # 1 outline (dark)
-    "#ffffff",  # 2 body white
-    "#dfe3ec",  # 3 light gray shade
-    "#b9bfcf",  # 4 deeper shade
-    "#14121a",  # 5 eye black
+    "#2b2430",  # 1 outline, eyes
+    "#a06c40", "#7f5230", "#5e3a22",  # 2-4 hair
+    "#f4cfa8", "#e2b088", "#c8916c",  # 5-7 skin
+    "#5d93d6", "#4072b4", "#2f5592",  # 8-10 shirt
+    "#969aa4", "#767a85", "#5a5d68",  # 11-13 trousers
+    "#6b4e3b", "#4d3729",  # 14-15 shoes
 ]
+HAIR, SKIN, SHIRT, TROUSERS, SHOES = (2, 3, 4), (5, 6, 7), (8, 9, 10), (11, 12, 13), (14, 14, 15)
+OUTLINE = 1
+FLOOR = 29  # lowest row of the feet
+HIP = 22  # first row of the legs when the body is not raised
+
+Pixels = set[tuple[int, int]]
 
 
-def blob_frame(view: str) -> Grid:
-    """Squat white blob, head+body in one. view: 'front' | 'back' | 'right'."""
-    cx, cy, rx, ry, floor_y = 15.5, 18.5, 12.1, 10.8, 27
-    inside = [[False] * CELL for _ in range(CELL)]
-    for y in range(CELL):
-        for x in range(CELL):
-            if y <= floor_y and ((x - cx) / rx) ** 2 + ((y - cy) / ry) ** 2 <= 1.0:
-                inside[y][x] = True
+def _rect(x0: int, y0: int, x1: int, y1: int) -> Pixels:
+    return {(x, y) for y in range(y0, y1 + 1) for x in range(x0, x1 + 1)}
 
-    def is_in(x: int, y: int) -> bool:
-        return 0 <= x < CELL and 0 <= y < CELL and inside[y][x]
 
+def _ellipse(cx: float, cy: float, rx: float, ry: float) -> Pixels:
+    return {
+        (x, y)
+        for y in range(CELL)
+        for x in range(CELL)
+        if ((x - cx) / rx) ** 2 + ((y - cy) / ry) ** 2 <= 1.0
+    }
+
+
+def _limb(x: int, width: int, top: int, bottom: int, lean: int = 0) -> Pixels:
+    """Vertical bar whose lower end is shifted sideways by `lean` pixels."""
+    span = max(1, bottom - top)
+    return {
+        (x + round(lean * (y - top) / span) + dx, y)
+        for y in range(top, bottom + 1)
+        for dx in range(width)
+    }
+
+
+def _shade(pixels: Pixels, x: int, y: int, ramp: tuple[int, int, int]) -> int:
+    """Light comes from the upper left, so the right side of each part is darkest."""
+    xs, ys = [p[0] for p in pixels], [p[1] for p in pixels]
+    t = 0.8 * (x - min(xs)) / max(1, max(xs) - min(xs)) + 0.2 * (y - min(ys)) / max(1, max(ys) - min(ys))
+    return ramp[2] if t > 0.82 else ramp[1] if t > 0.6 else ramp[0]
+
+
+def _paint(g: Grid, pixels: Pixels, ramp: tuple[int, int, int]) -> None:
+    """Fill a body part with a 1px outline."""
+    for x, y in pixels:
+        if any((x + dx, y + dy) not in pixels for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1))):
+            g[y][x] = OUTLINE
+        else:
+            g[y][x] = _shade(pixels, x, y, ramp)
+
+
+def _recolor(g: Grid, pixels: Pixels, ramp: tuple[int, int, int]) -> None:
+    """Change the fill inside an already painted part, keeping its outline."""
+    for x, y in pixels:
+        if g[y][x] not in (0, OUTLINE):
+            g[y][x] = _shade(pixels, x, y, ramp)
+
+
+def _in_shadow(ramp: tuple[int, int, int]) -> tuple[int, int, int]:
+    """The same color one step darker, for limbs on the far side of the body."""
+    return ramp[1], ramp[2], ramp[2]
+
+
+def _leg(g: Grid, x: int, width: int, top: int, foot: int, lean: int = 0, toe: int = 0, far: bool = False) -> None:
+    """Trouser leg ending in a shoe whose sole is on row `foot`. toe: extra length to the right."""
+    trousers = _in_shadow(TROUSERS) if far else TROUSERS
+    _paint(g, _limb(x, width, top, foot - 1, lean), trousers)
+    _paint(g, _rect(x + lean, foot - 2, x + lean + width - 1 + toe, foot), SHOES)
+
+
+def _arm(g: Grid, x: int, width: int, top: int, bottom: int, lean: int = 0, far: bool = False) -> None:
+    """Sleeve ending in a 2-row hand."""
+    arm = _limb(x, width, top, bottom, lean)
+    _paint(g, arm, _in_shadow(SHIRT) if far else SHIRT)
+    _recolor(g, {p for p in arm if p[1] >= bottom - 1}, _in_shadow(SKIN) if far else SKIN)
+
+
+def _front_or_back(view: str, stride: int) -> Grid:
     g = empty_grid()
-    for y in range(CELL):
-        for x in range(CELL):
-            if not inside[y][x]:
-                continue
-            edge = not all(is_in(x + dx, y + dy) for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)))
-            if edge:
-                g[y][x] = 1
-                continue
-            # light from upper-left: rounded falloff toward the lower-right rim
-            d = (((x - (cx - 3.5)) / rx) ** 2 + ((y - (cy - 4.5)) / ry) ** 2) ** 0.5
-            g[y][x] = 4 if d > 1.18 else 3 if d > 0.95 else 2
+    y = -1 if stride else 0  # the body rises 1px on each step
+    # One leg lifts 2px while the other stays on the floor. The opposite arm swings forward.
+    _leg(g, 11, 5, HIP + y, FLOOR - 2 if stride > 0 else FLOOR)
+    _leg(g, 16, 5, HIP + y, FLOOR - 2 if stride < 0 else FLOOR)
+    _arm(g, 7, 4, 16 + y, 22 + y + 2 * stride)
+    _arm(g, 21, 4, 16 + y, 22 + y - 2 * stride)
+    _paint(g, _rect(10, 15 + y, 21, 22 + y), SHIRT)
 
-    eye_rows = (17, 18)
-    if view == "front":
-        eye_cols = (11, 20)
-    elif view == "right":
-        eye_cols = (22,)
-    else:  # back: no eyes
-        eye_cols = ()
-    for ex in eye_cols:
-        for ey in eye_rows:
-            g[ey][ex] = 5
+    head = _ellipse(15.5, 9.5 + y, 8.8, 7.1)
+    _paint(g, head, SKIN)
+    if view == "back":
+        _recolor(g, head, HAIR)
+        return g
+
+    hair = {p for p in head if p[1] <= 7 + y}  # top of the head
+    hair |= {p for p in head if p[1] <= 11 + y and (p[0] <= 8 or p[0] >= 23)}  # sides
+    hair |= {(x, 8 + y) for x in range(9, 23) if x % 3 != 0}  # uneven fringe
+    _recolor(g, hair, HAIR)
+    for x in (11, 12, 19, 20):
+        g[11 + y][x] = g[12 + y][x] = OUTLINE
+    g[14 + y][15] = g[14 + y][16] = SKIN[2]
+    return g
+
+
+def _right(stride: int) -> Grid:
+    g = empty_grid()
+    y = -1 if stride else 0
+    near = 3 * stride  # near leg swings forward on +1, back on -1
+    swing = 4 * stride
+    # Far side first, so that the near limbs are drawn over it. The arm on each side
+    # swings against the leg on that side, and the leg moving backward lifts its heel.
+    _arm(g, 14, 4, 16 + y, 22 + y, lean=swing, far=True)
+    _leg(g, 14, 4, HIP + y, FLOOR - (1 if stride > 0 else 0), lean=-near, toe=2, far=True)
+    _leg(g, 14, 4, HIP + y, FLOOR - (1 if stride < 0 else 0), lean=near, toe=2)
+    _paint(g, _rect(12, 15 + y, 19, 22 + y), SHIRT)
+    _arm(g, 14, 4, 16 + y, 22 + y, lean=-swing)
+
+    head = _ellipse(15.5, 9.5 + y, 8.8, 7.1) | _rect(24, 11 + y, 24, 13 + y) | {(25, 12 + y)}  # nose
+    _paint(g, head, SKIN)
+    hair = {p for p in head if p[1] <= 7 + y or p[0] <= 14}  # top and back of the head
+    hair |= {(x, 8 + y) for x in range(15, 24) if x % 3 != 0}  # uneven fringe
+    _recolor(g, hair, HAIR)
+    for ear_y in (10, 11, 12):
+        g[ear_y + y][13] = g[ear_y + y][14] = SKIN[1]
+    for x in (20, 21):
+        g[11 + y][x] = g[12 + y][x] = OUTLINE
+    g[14 + y][22] = g[14 + y][23] = SKIN[2]
     return g
 
 
 def default_sheet() -> Image.Image:
-    return build_sheet(blob_frame("front"), blob_frame("back"), blob_frame("right"), BLOB_PALETTE)
+    """Humanoid template, drawn frame by frame for a real walk cycle.
+
+    walk_frames() only moves one still pose, which is all a generated character has.
+    Frame timing matches it: 0 and 2 stand on the floor, 1 and 3 are raised 1px.
+    """
+    strides = (0, 1, 0, -1)
+    rows = {
+        "down": [_front_or_back("front", s) for s in strides],
+        "left": [flip_h(_right(s)) for s in strides],
+        "right": [_right(s) for s in strides],
+        "up": [_front_or_back("back", s) for s in strides],
+    }
+    sheet = Image.new("RGBA", (CELL * COLS, CELL * len(ROW_ORDER)), (0, 0, 0, 0))
+    for r, direction in enumerate(ROW_ORDER):
+        for c, frame in enumerate(rows[direction]):
+            sheet.paste(grid_to_image(frame, DEFAULT_PALETTE), (c * CELL, r * CELL))
+    return sheet
